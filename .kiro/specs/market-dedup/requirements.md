@@ -1,55 +1,58 @@
-# Requirements: Delphi Evidence Pre-Check (CLI)
+# Requirements: Delphi Evidence Pre-Check (delphi-check)
 
-Replaces the earlier platform-side design. Based on the user's screenshot and the Delphi docs.
+Status: implemented in `src/`. This document describes what the tool does today.
 
 ## Problem
-The user submits evidence notes through Delphi's *Sell information* feature (e.g. "As of 2026-11-25: Japan's food consumption tax cut bill ..."). Many come back as **Not accepted: We already have this**. Per the Delphi docs, that means the same information was already accepted on that market, from the user or from someone else. Delphi does not say which earlier submission matched. Rejected submissions still count toward the per-market limit, so each wasted submission reduces what the user can send later.
+Evidence notes sent through Delphi's *Sell information* feature often come back as **Not accepted: We already have this information**. Delphi marks a submission `duplicate` when every item (note, link, file) already exists on that market, from any account, and it does not say which one matched. The account limit is 1 submission per market and 5 per hour, so wasted submissions are costly.
 
 ## Scope
-A local Linux command-line tool that checks a draft note before it is sent, using only data the user is allowed to see. It does not bypass or probe Delphi's own duplicate check.
+A local Linux command-line tool that checks a draft note before it is sent. It uses only the official Delphi API and the user's own key. It does not bypass or probe Delphi's duplicate or fraud checks.
 
 ## Known limit
-The tool cannot see other users' accepted submissions. It reduces self-duplicates and low-value submissions. It cannot guarantee that a submission is not a duplicate of someone else's.
+The tool cannot see other users' submissions. It estimates risk from the user's own history, Delphi's `entry-state`, and the quality of the note. A `SEND` verdict is not a guarantee.
 
-## Assumptions (confirm)
-- **[A1]** The user has a Delphi Mainnet API key from api-access.delphi.fyi and has signed in to the app once.
-- **[A2]** The user runs Linux with Node.js 20 or newer.
-- **[A3]** The tool uses the official `@gensyn-ai/gensyn-delphi-sdk` (version 2.3.0 or newer).
-- **[A4]** The user writes the notes. The tool does not invent facts.
+## Assumptions
+- A1. The user has a Mainnet API key from api-access.delphi.fyi and has signed in to the Delphi app once.
+- A2. Node.js 20 or newer on Linux.
+- A3. The user writes the notes. The tool never creates facts.
 
 ## Requirements
 
 ### R1. Sync history
-- R1.1 `delphi-check sync` downloads the user's past submissions (`listSubmissions`) and their statuses into a local SQLite file.
-- R1.2 Each stored submission keeps market address, note text, links, status, reason, and timestamp.
-- R1.3 Sync can be re-run safely and only adds or updates records.
+- R1.1 `sync` downloads all past submissions (`GET /submissions`, following `nextCursor`) into a local JSON cache.
+- R1.2 Each stored entry has market address, note, links, status, per-market verdict and reason, bounty, and timestamp.
+- R1.3 Re-running `sync` updates existing entries and adds new ones.
+- R1.4 Market questions are fetched and cached for each market in the history.
 
 ### R2. Check a draft
-- R2.1 `delphi-check check --market <address> --note <file|text> [--link <url>...]` returns a verdict: `send`, `review`, or `skip`.
-- R2.2 It compares the draft against the user's own past submissions on the same market. A near-identical or reworded fact returns `skip` with the matching past submission shown.
-- R2.3 It extracts the claim parts (subject, date, number, source domain) and compares them. Changing only wording does not make a fact new.
-- R2.4 It warns when the draft has no concrete date, no source link, or reads as a prediction instead of a fact (Delphi docs say these are less likely to be accepted).
-- R2.5 It warns when the draft only restates the market's own question or description, which Delphi already has.
-- R2.6 It calls `getEntryState` for the market and reports submissions left. If none are left, the verdict is `skip`.
-- R2.7 Every verdict lists its reasons.
+- R2.1 `check --market <0x…> --note <text|@file> [--link URL …]` prints a verdict `SEND`, `REVIEW`, or `SKIP` with a 0 to 100 risk score, concerns, and good signs. Exit codes: 0 send, 3 review, 1 skip.
+- R2.2 Delphi's `entry-state` is read first. If `canSubmit` is false, the verdict is `SKIP` and the reason is explained.
+- R2.3 A draft with text similarity of 0.80 or more to any earlier submission, or the same facts with nothing new, is `SKIP`. Similarity from 0.60 raises risk.
+- R2.4 The tool extracts dates, numbers, IDs, entities, and link domains, and compares them with earlier notes so reworded duplicates are caught.
+- R2.5 The tool raises risk when the note has no concrete date, no source link, no specific number or ID, hedging or predictive wording, a very short length, a stale or future "As of" date, or mostly repeats the market question.
+- R2.6 Widely covered news domains raise risk. Primary-source domains (government, parliament, official bodies) lower it.
+- R2.7 Domains that appeared in several of the user's duplicates and never in an accepted submission raise risk.
+- R2.8 More than 2 links or a note over 8,000 characters is `SKIP`.
+- R2.9 If `entry-state` cannot be read, the tool adds a warning and does not treat that as permission.
+- R2.10 Thresholds are configurable with `DELPHI_CHECK_SKIP` (default 60) and `DELPHI_CHECK_REVIEW` (default 35).
 
-### R3. Find an angle
-- R3.1 `delphi-check angles --market <address>` lists the user's past accepted and rejected facts on that market and shows which fact types have not been tried (e.g. official schedule, vote count, local notice, source document).
-- R3.2 The command suggests what kind of evidence to look for. It does not write facts.
+### R3. Find markets
+- R3.1 `markets [--scan N] [--top N]` lists open markets from the markets API, removes those the user already used, keeps only those where `entry-state.canSubmit` is true, and sorts by remaining reward pot.
 
-### R4. Gated submit (optional)
-- R4.1 `delphi-check submit` runs the check first and sends only on `send`, after the user confirms on the terminal.
-- R4.2 Submissions use an `Idempotency-Key`, and the tool respects `RateLimit-*` headers and `getLimits`.
-- R4.3 The tool never sends in batch or loop mode without a confirmation per submission.
-- R4.4 The tool refuses to submit if the terms are not accepted and tells the user to accept them in the app or with `getTerms`.
+### R4. Gated submit
+- R4.1 `submit` runs the same check first. `SKIP` never submits. `REVIEW` submits only with `--allow-review`.
+- R4.2 The tool verifies the terms are accepted, shows the note and links, and asks for `y/N` confirmation. `--yes` skips the prompt and is meant for the user only.
+- R4.3 Submissions use an `Idempotency-Key` and are polled until judged. The result is stored locally.
+- R4.4 There is no batch or loop mode.
 
-### R5. Reporting
-- R5.1 `delphi-check stats` shows acceptance rate, duplicate rate, and rejected-count per market from local history.
+### R5. Status and stats
+- R5.1 `status` shows terms, hourly and per-market limits, reward cap, and cache state.
+- R5.2 `stats` shows counts by verdict, recorded bounties, and per-source totals, duplicates, and accepted counts.
 
 ### R6. Security and privacy
-- R6.1 The API key is read from the `DELPHI_API_ACCESS_KEY` environment variable and is never written to disk or logs.
-- R6.2 Submission text stays on the local machine. No third-party service is called by default. Embedding support is opt-in.
-- R6.3 The local database file has permissions `0600`.
+- R6.1 The API key is read only from `DELPHI_API_ACCESS_KEY` or a local git-ignored `.env`. It is never written to the cache or printed.
+- R6.2 The cache directory is `0700` and `history.json` is `0600`. No third-party service is called.
+- R6.3 API errors are shown with the Delphi error code and message. 429 and 5xx responses are retried with backoff.
 
 ## Out of scope
-Trading, creating markets, generating or fabricating evidence, scraping the web app, inferring other users' submissions, and evading Delphi's duplicate or fraud checks.
+Trading, creating markets, generating or fabricating evidence, scraping the web app, inferring other users' submissions, and evading Delphi's duplicate or fraud checks. Semantic embeddings are not implemented.
